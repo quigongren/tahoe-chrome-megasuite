@@ -1,0 +1,608 @@
+#!/bin/zsh
+set -e
+
+echo "========================================"
+echo "  DriveOps One-Click Installer"
+echo "  Repo root:   \$HOME/Documents/GitHub"
+echo "========================================"
+
+# Core paths
+GITHUB_ROOT="$HOME/Documents/GitHub"
+DRIVEOPS_ROOT="$GITHUB_ROOT/DriveOps-Project"
+BIN_DIR="$HOME/bin"
+SWIFTBAR_PLUGINS="$HOME/Library/Application Support/SwiftBar/plugins"
+LAUNCHAGENTS_DIR="$HOME/Library/LaunchAgents"
+LOG_DIR="$HOME/Library/Logs"
+
+mkdir -p "$GITHUB_ROOT"
+mkdir -p "$DRIVEOPS_ROOT"
+mkdir -p "$BIN_DIR"
+mkdir -p "$SWIFTBAR_PLUGINS"
+mkdir -p "$LAUNCHAGENTS_DIR"
+mkdir -p "$LOG_DIR"
+
+echo "➡ Using GitHub root: $GITHUB_ROOT"
+echo "➡ DriveOps root:     $DRIVEOPS_ROOT"
+echo
+
+########################################
+# 1) SwiftBar Git Repo Dashboard
+########################################
+SWIFTBAR_PLUGIN_PATH="$SWIFTBAR_PLUGINS/git-dashboard.5m.sh"
+
+cat << 'EOF' > "$SWIFTBAR_PLUGIN_PATH"
+#!/bin/zsh
+
+REPO_ROOT="$HOME/Documents/GitHub"
+
+echo "📁 Git"
+echo "---"
+
+if [ ! -d "$REPO_ROOT" ]; then
+    echo "❌ Repo root missing: $REPO_ROOT"
+    exit 0
+fi
+
+for repo in "$REPO_ROOT"/*; do
+    if [ -d "$repo/.git" ]; then
+        name=$(basename "$repo")
+        cd "$repo" || continue
+
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+        status=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null)
+        behind=$(git rev-list --count HEAD..@{u} 2>/dev/null)
+
+        badge=""
+        if [ "$status" -gt 0 ]; then
+            badge="⚠️ $status"
+        else
+            badge="✔️"
+        fi
+
+        echo "$name ($branch) $badge | dropdown=false"
+        echo "--Open in Finder | shell=open param1=\"$repo\" terminal=false"
+        echo "--Open in VS Code | shell=code param1=\"$repo\" terminal=false"
+
+        if [ -n "$branch" ]; then
+            echo "--Pull | shell=git param1=pull param2=origin param3=$branch terminal=false refresh=true"
+            echo "--Push | shell=git param1=push param2=origin param3=$branch terminal=false refresh=true"
+        fi
+
+        echo "--Repo Path: $repo | href=file://$repo"
+
+        if [ "$ahead" -gt 0 ] || [ "$behind" -gt 0 ]; then
+            echo "--Ahead: $ahead Behind: $behind"
+        fi
+
+        echo "---"
+    fi
+done
+EOF
+
+chmod +x "$SWIFTBAR_PLUGIN_PATH"
+echo "✅ SwiftBar Git dashboard installed at:"
+echo "   $SWIFTBAR_PLUGIN_PATH"
+echo "   (SwiftBar will auto-pick it up if running.)"
+echo
+
+########################################
+# 2) DriveOps Multi-Repo Watcher
+########################################
+WATCHER_SCRIPT="$BIN_DIR/driveops-repo-watcher.sh"
+
+cat << 'EOF' > "$WATCHER_SCRIPT"
+#!/bin/zsh
+
+REPO_ROOT="$HOME/Documents/GitHub"
+LOG="$HOME/Library/Logs/driveops-repo-watcher.log"
+DATE=$(date "+%Y-%m-%d %H:%M:%S")
+
+mkdir -p "$(dirname "$LOG")"
+
+echo "=== DriveOps Repo Watcher: $DATE ===" >> "$LOG"
+
+for repo in "$REPO_ROOT"/*; do
+    if [ -d "$repo/.git" ]; then
+        cd "$repo" || continue
+        name=$(basename "$repo")
+        branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+
+        ahead=$(git rev-list --count @{u}..HEAD 2>/dev/null)
+        behind=$(git rev-list --count HEAD..@{u} 2>/dev/null)
+        changes=$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
+        echo "→ $name ($branch)" >> "$LOG"
+        echo "   changes: $changes ahead: $ahead behind: $behind" >> "$LOG"
+
+        if [ "$changes" -gt 0 ]; then
+            echo "   ⚠️ local changes present" >> "$LOG"
+        fi
+        if [ "$ahead" -gt 0 ]; then
+            echo "   ⬆ ahead of origin by $ahead commits" >> "$LOG"
+        fi
+        if [ "$behind" -gt 0 ]; then
+            echo "   ⬇ behind origin by $behind commits" >> "$LOG"
+        fi
+
+        echo "" >> "$LOG"
+    fi
+done
+
+echo "" >> "$LOG"
+EOF
+
+chmod +x "$WATCHER_SCRIPT"
+echo "✅ DriveOps watcher script installed at:"
+echo "   $WATCHER_SCRIPT"
+echo
+
+# LaunchAgent for watcher
+WATCHER_PLIST="$LAUNCHAGENTS_DIR/com.carl.driveops-repo-watcher.plist"
+
+cat << EOF > "$WATCHER_PLIST"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple Computer//DTD PLIST 1.0//EN"
+"https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.carl.driveops-repo-watcher</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>$WATCHER_SCRIPT</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+EOF
+
+launchctl unload "$WATCHER_PLIST" 2>/dev/null || true
+launchctl load "$WATCHER_PLIST" 2>/dev/null || true
+
+echo "✅ LaunchAgent loaded:"
+echo "   $WATCHER_PLIST"
+echo
+
+########################################
+# 3) Python Web Dashboard + Console
+########################################
+PY_DIR="$DRIVEOPS_ROOT/driveops-dashboard"
+mkdir -p "$PY_DIR"
+
+# Web dashboard
+cat << 'EOF' > "$PY_DIR/driveops_web_dashboard.py"
+import os
+import subprocess
+from pathlib import Path
+from flask import Flask, jsonify, render_template_string
+
+app = Flask(__name__)
+
+REPO_ROOT = Path.home() / "Documents" / "GitHub"
+
+TEMPLATE = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>DriveOps Repo Dashboard</title>
+  <style>
+    body { font-family: system-ui, -apple-system, sans-serif; margin: 20px; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #ddd; font-size: 14px; }
+    th { text-align: left; background: #f5f5f5; }
+    .clean { color: #15803d; }
+    .dirty { color: #b45309; }
+  </style>
+</head>
+<body>
+  <h1>DriveOps Repo Dashboard</h1>
+  <p>Root: {{ root }}</p>
+  <table>
+    <tr>
+      <th>Repo</th>
+      <th>Branch</th>
+      <th>Changes</th>
+      <th>Ahead</th>
+      <th>Behind</th>
+      <th>Path</th>
+    </tr>
+    {% for r in repos %}
+    <tr>
+      <td>{{ r.name }}</td>
+      <td>{{ r.branch }}</td>
+      <td class="{{ 'dirty' if r.changes > 0 else 'clean' }}">
+        {{ r.changes if r.changes > 0 else 'Clean' }}
+      </td>
+      <td>{{ r.ahead }}</td>
+      <td>{{ r.behind }}</td>
+      <td><code>{{ r.path }}</code></td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>
+"""
+
+def run_git(args, cwd):
+    try:
+        out = subprocess.check_output(["git"] + args, cwd=cwd, stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except subprocess.CalledProcessError:
+        return ""
+
+def get_repos():
+    repos = []
+    if not REPO_ROOT.is_dir():
+        return repos
+
+    for child in REPO_ROOT.iterdir():
+        if not child.is_dir():
+            continue
+        if not (child / ".git").is_dir():
+            continue
+
+        branch = run_git(["rev-parse", "--abbrev-ref", "HEAD"], str(child))
+        if not branch:
+            continue
+
+        status_out = run_git(["status", "--porcelain"], str(child))
+        changes = len(status_out.splitlines()) if status_out else 0
+
+        ahead = run_git(["rev-list", "--count", "@{u}..HEAD"], str(child))
+        behind = run_git(["rev-list", "--count", "HEAD..@{u}"], str(child))
+
+        repos.append({
+            "name": child.name,
+            "path": str(child),
+            "branch": branch,
+            "changes": changes,
+            "ahead": int(ahead or 0),
+            "behind": int(behind or 0),
+        })
+    return repos
+
+@app.route("/api/repos")
+def api_repos():
+    return jsonify(get_repos())
+
+@app.route("/")
+def dashboard():
+    return render_template_string(TEMPLATE, root=str(REPO_ROOT), repos=get_repos())
+
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5050, debug=False)
+EOF
+
+# Console
+cat << 'EOF' > "$PY_DIR/driveops_console.py"
+import os
+from pathlib import Path
+from datetime import datetime
+
+LOG_ROOT = Path.home() / "Library" / "Logs"
+
+LOG_FILES = {
+    "Repo Watcher": LOG_ROOT / "driveops-repo-watcher.log",
+}
+
+def tail(path: Path, lines: int = 50):
+    if not path.is_file():
+        return ["(log file missing)"]
+    with path.open("r", errors="ignore") as f:
+        data = f.read().splitlines()
+    return data[-lines:] if len(data) > lines else data
+
+def summarize_repo_watcher(lines):
+    repos = 0
+    dirty = 0
+    ahead = 0
+    behind = 0
+
+    for line in lines:
+        if line.startswith("→ "):
+            repos += 1
+        if "local changes present" in line:
+            dirty += 1
+        if "ahead of origin" in line:
+            ahead += 1
+        if "behind origin" in line:
+            behind += 1
+
+    return {
+        "repos": repos,
+        "dirty": dirty,
+        "ahead": ahead,
+        "behind": behind,
+    }
+
+def main():
+    print("=" * 70)
+    print(f" DriveOps Console  |  {datetime.now().isoformat(sep=' ', timespec='seconds')}")
+    print("=" * 70)
+
+    for label, path in LOG_FILES.items():
+        print(f"\n[{label}]")
+        print(f"Path: {path}")
+
+        lines = tail(path, lines=80)
+
+        if label == "Repo Watcher":
+            summary = summarize_repo_watcher(lines)
+            print(
+                f"Summary: {summary['repos']} repos | "
+                f"{summary['dirty']} dirty | "
+                f"{summary['ahead']} ahead | "
+                f"{summary['behind']} behind"
+            )
+
+        print("-" * 70)
+        for l in lines[-20:]:
+            print(l)
+        print("-" * 70)
+
+if __name__ == "__main__":
+    main()
+EOF
+
+echo "✅ Python web dashboard & console created at:"
+echo "   $PY_DIR"
+echo "   Run:  python3 driveops_web_dashboard.py"
+echo "         python3 driveops_console.py"
+echo
+
+echo "➡ Attempting to ensure Flask is installed (python3 -m pip install --user flask)..."
+python3 -m pip install --user flask >/dev/null 2>&1 || echo "   (Flask install may have failed; install manually if needed.)"
+echo
+
+########################################
+# 4) SwiftUI Repo Monitor (Swift Package)
+########################################
+SWIFT_DIR="$DRIVEOPS_ROOT/DriveOpsRepoMonitor"
+mkdir -p "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp"
+
+cat << 'EOF' > "$SWIFT_DIR/Package.swift"
+// swift-tools-version: 5.9
+
+import PackageDescription
+
+let package = Package(
+    name: "DriveOpsRepoMonitor",
+    platforms: [
+        .macOS(.v13)
+    ],
+    products: [
+        .executable(name: "DriveOpsRepoMonitor", targets: ["DriveOpsRepoMonitorApp"])
+    ],
+    targets: [
+        .executableTarget(
+            name: "DriveOpsRepoMonitorApp",
+            path: "Sources/DriveOpsRepoMonitorApp"
+        )
+    ]
+)
+EOF
+
+cat << 'EOF' > "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp/RepoStatus.swift"
+import Foundation
+
+struct RepoStatus: Identifiable {
+    let id = UUID()
+    let name: String
+    let path: URL
+    let branch: String
+    let changes: Int
+    let ahead: Int
+    let behind: Int
+}
+EOF
+
+cat << 'EOF' > "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp/GitRepoService.swift"
+import Foundation
+
+final class GitRepoService {
+    let repoRoot: URL
+
+    init(repoRoot: URL =
+        FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Documents/GitHub")) {
+        self.repoRoot = repoRoot
+    }
+
+    func fetchRepos() -> [RepoStatus] {
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: repoRoot,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+
+        var results: [RepoStatus] = []
+
+        for url in contents {
+            let gitDir = url.appendingPathComponent(".git")
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: gitDir.path, isDirectory: &isDir),
+               isDir.boolValue {
+                if let status = inspectRepo(at: url) {
+                    results.append(status)
+                }
+            }
+        }
+
+        return results.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    private func runGit(_ args: [String], in directory: URL) -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git"] + args
+        process.currentDirectoryURL = directory
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+
+        do {
+            try process.run()
+        } catch {
+            return ""
+        }
+        process.waitUntilExit()
+
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private func inspectRepo(at url: URL) -> RepoStatus? {
+        let name = url.lastPathComponent
+
+        let branch = runGit(["rev-parse", "--abbrev-ref", "HEAD"], in: url)
+        if branch.isEmpty { return nil }
+
+        let changesStr = runGit(["status", "--porcelain"], in: url)
+        let changes = changesStr.isEmpty ? 0 : changesStr.split(separator: "\n").count
+
+        let aheadStr = runGit(["rev-list", "--count", "@{u}..HEAD"], in: url)
+        let behindStr = runGit(["rev-list", "--count", "HEAD..@{u}"], in: url)
+
+        let ahead = Int(aheadStr) ?? 0
+        let behind = Int(behindStr) ?? 0
+
+        return RepoStatus(
+            name: name,
+            path: url,
+            branch: branch,
+            changes: changes,
+            ahead: ahead,
+            behind: behind
+        )
+    }
+}
+EOF
+
+cat << 'EOF' > "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp/RepoListViewModel.swift"
+import Foundation
+
+@MainActor
+final class RepoListViewModel: ObservableObject {
+    @Published var repos: [RepoStatus] = []
+    @Published var isLoading = false
+
+    private let service = GitRepoService()
+
+    func refresh() {
+        isLoading = true
+        Task {
+            let result = await withCheckedContinuation { continuation in
+                DispatchQueue.global(qos: .utility).async {
+                    let repos = self.service.fetchRepos()
+                    continuation.resume(returning: repos)
+                }
+            }
+            self.repos = result
+            self.isLoading = false
+        }
+    }
+}
+EOF
+
+cat << 'EOF' > "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp/ContentView.swift"
+import SwiftUI
+
+struct ContentView: View {
+    @ObservedObject var viewModel: RepoListViewModel
+
+    var body: some View {
+        VStack(alignment: .leading) {
+            HStack {
+                Text("DriveOps Repo Monitor")
+                    .font(.title2).bold()
+                Spacer()
+                Button {
+                    viewModel.refresh()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(viewModel.isLoading)
+            }
+            .padding([.top, .horizontal])
+
+            List(viewModel.repos) { repo in
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Text(repo.name)
+                            .font(.headline)
+                        Spacer()
+                        Text(repo.branch)
+                            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack(spacing: 12) {
+                        if repo.changes > 0 {
+                            Text("⚠︎ \(repo.changes) changes")
+                                .font(.caption)
+                        } else {
+                            Text("✔ Clean")
+                                .font(.caption)
+                                .foregroundColor(.green)
+                        }
+
+                        if repo.ahead > 0 {
+                            Text("↑ \(repo.ahead)")
+                                .font(.caption)
+                        }
+                        if repo.behind > 0 {
+                            Text("↓ \(repo.behind)")
+                                .font(.caption)
+                        }
+                    }
+
+                    Text(repo.path.path)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .onAppear { viewModel.refresh() }
+    }
+}
+EOF
+
+cat << 'EOF' > "$SWIFT_DIR/Sources/DriveOpsRepoMonitorApp/main.swift"
+import SwiftUI
+
+@main
+struct DriveOpsRepoMonitorMainApp: App {
+    var body: some Scene {
+        WindowGroup {
+            ContentView(viewModel: RepoListViewModel())
+        }
+    }
+}
+EOF
+
+echo "✅ SwiftUI repo monitor created at:"
+echo "   $SWIFT_DIR"
+echo "   Open in Xcode with:  open Package.swift"
+echo
+
+echo "========================================"
+echo "✅ DriveOps One-Click Installer Complete"
+echo "----------------------------------------"
+echo "SwiftBar plugin:  $SWIFTBAR_PLUGIN_PATH"
+echo "Watcher script:   $WATCHER_SCRIPT"
+echo "Watcher log:      $LOG_DIR/driveops-repo-watcher.log"
+echo "Python tools:     $PY_DIR"
+echo "SwiftUI app:      $SWIFT_DIR"
+echo "========================================"
+
